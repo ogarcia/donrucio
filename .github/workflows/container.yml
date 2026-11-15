@@ -5,9 +5,15 @@ on:
     branches: [master]
     # Bare semver tags: 0.1.0, 1.2.3-rc1 (no "v" prefix)
     tags: ["[0-9]*"]
+    # paths-ignore (not an allowlist) on purpose: a release tag pushed onto an
+    # existing commit has no file diff, which an allowlist would skip. A commit
+    # touching only these non-build files won't rebuild the image.
     paths-ignore:
       - "README.md"
       - "LICENSE"
+      - ".env.example"
+      - ".gitignore"
+      - ".github/workflows/ci.yml"
   pull_request:
     paths:
       - "Containerfile"

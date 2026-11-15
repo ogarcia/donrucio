@@ -1,15 +1,22 @@
 name: CI
 
 on:
+  # Only code/build changes run the tests — editing the README, LICENSE or
+  # other non-code files never triggers CI. (This job has no tag trigger, so an
+  # allowlist is safe; a tag push with no file diff would be skipped by one.)
   push:
     branches: [master]
-    paths-ignore:
-      - "README.md"
-      - "LICENSE"
+    paths:
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/ci.yml"
   pull_request:
-    paths-ignore:
-      - "README.md"
-      - "LICENSE"
+    paths:
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/ci.yml"
 
 env:
   CARGO_TERM_COLOR: always
