@@ -20,6 +20,9 @@
 //!   DOCS_REFRESH_HOURS   default: 6   (0 disables periodic refresh)
 //!   GITHUB_TOKEN         optional — raises the GitHub API rate limit
 //!   POLL_TIMEOUT_SECS    default: 30  (Telegram long-poll timeout)
+//!   SUGGESTIONS_FILE     default: <docs-cache-dir>/suggestions.jsonl
+//!                        (where flagged feature suggestions are logged;
+//!                         set empty to disable)
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -50,6 +53,7 @@ struct Config {
     reasoning_effort: String,
     history_messages: usize,
     idle_reset: Option<Duration>,
+    suggestions_path: Option<PathBuf>,
 }
 
 fn env_or(key: &str, default: &str) -> String {
@@ -78,6 +82,15 @@ impl Config {
 
         let refresh_hours: u64 = env_or("DOCS_REFRESH_HOURS", "6").parse().unwrap_or(6);
         let refresh = (refresh_hours > 0).then(|| Duration::from_secs(refresh_hours * 3600));
+
+        // Where flagged feature suggestions are appended (JSONL). Defaults beside
+        // the docs cache so one persisted directory keeps both; an explicit empty
+        // value disables logging.
+        let suggestions_path = match std::env::var("SUGGESTIONS_FILE") {
+            Ok(p) if p.trim().is_empty() => None,
+            Ok(p) => Some(PathBuf::from(p)),
+            Err(_) => cache_path.parent().map(|d| d.join("suggestions.jsonl")),
+        };
 
         Ok(Config {
             tg_token,
@@ -109,6 +122,7 @@ impl Config {
                 let mins: u64 = env_or("HISTORY_IDLE_MINS", "30").parse().unwrap_or(30);
                 (mins > 0).then(|| Duration::from_secs(mins * 60))
             },
+            suggestions_path,
         })
     }
 }
@@ -228,8 +242,28 @@ A: \"De tu novia no entiendo, pero yo que tú me instalaba Rucio, que seguro mal
 no hace. 🫏\"\n\
 - You may use the earlier conversation for context (follow-up questions), but \
 still ground every Rucio answer in the docs below.\n\
+- Some messages are SUGGESTIONS or feature requests, not questions (\"it would \
+be nice if…\", \"you should add…\", \"I'd like to be able to…\"). Judge them:\n\
+  • If the user can get what they want today — it is already in the docs, or a \
+simple workaround in their own environment does it (installing a package in \
+their own container or a running one, changing a config) — do NOT record it, \
+even if phrased as \"you should add…\": just show them how, briefly. Example — \
+\"you should put bash in the container image\" → explain that they can install it \
+themselves in their own image/container, and record nothing.\n\
+  • Only record an idea that genuinely needs a change to Rucio itself that the \
+user cannot do on their own: a new feature, a UI/UX improvement, a new option, a \
+changed default. Acknowledge it warmly but WITHOUT promising it will be done — \
+say you will note it for the maintainer to consider — and use the suggestion tag \
+below.\n\
+  If unsure whether something already exists, treat it as a question and answer \
+from the docs; never claim a feature exists when it does not.\n\
 - Be concise, use plain text (no Markdown tables), and answer in the same \
-language the user used.\n\n\
+language the user used.\n\
+- SUGGESTION TAG: when, and only when, you decide to record a suggestion per the \
+rule above, make the VERY FIRST line of your reply exactly \"[SUGGESTION] <one \
+concise sentence in English describing the requested feature>\", then a blank \
+line, then your normal human reply in the user's language. Never use this tag \
+for anything else, and never mention it to the user.\n\n\
 === RUCIO DOCUMENTATION ===\n{docs}\n=== END DOCUMENTATION ==="
     )
 }
@@ -500,6 +534,95 @@ fn ask_groq(agent: &ureq::Agent, cfg: &Config, messages: Vec<Value>) -> Result<S
         .and_then(Value::as_str)
         .map(|s| s.trim().to_string())
         .ok_or_else(|| anyhow!("unexpected Groq response: {body}"))
+}
+
+// ── Suggestions ─────────────────────────────────────────────────────────────
+//
+// The model flags a recordable feature suggestion by prefixing its reply with a
+// line `[SUGGESTION] <summary>`. We pull that summary out, log it, and send the
+// rest of the reply as usual — the user never sees the tag.
+
+/// Current UNIX time in whole seconds.
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Format a UNIX timestamp as an ISO-8601 UTC string (second precision), so the
+/// log is human-readable without pulling in a date crate. Civil date from days
+/// since the epoch via Howard Hinnant's algorithm.
+fn iso_utc(secs: u64) -> String {
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    let (h, m, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let month = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    let year = if month <= 2 { y + 1 } else { y };
+    format!("{year:04}-{month:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
+}
+
+/// If the model prefixed its reply with a `[SUGGESTION] …` line, return that
+/// summary (if non-empty) and the reply with the marker line stripped.
+fn extract_suggestion(answer: &str) -> (Option<String>, String) {
+    let first = answer.lines().next().unwrap_or("");
+    if let Some(rest) = first.trim_start().strip_prefix("[SUGGESTION]") {
+        let summary = rest.trim().to_string();
+        let body = answer
+            .split_once('\n')
+            .map(|x| x.1)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        return ((!summary.is_empty()).then_some(summary), body);
+    }
+    (None, answer.to_string())
+}
+
+/// Append a flagged suggestion to the JSONL log (best-effort; never fatal).
+fn log_suggestion(cfg: &Config, msg: &Value, chat_id: i64, summary: &str, raw: &str) {
+    let Some(path) = cfg.suggestions_path.as_ref() else {
+        return;
+    };
+    let ts = now_secs();
+    let from = msg.get("from");
+    let entry = json!({
+        "ts": ts,
+        "date": iso_utc(ts),
+        "summary": summary,
+        "message": truncate(raw, 500),
+        "chat_id": chat_id,
+        "chat_type": msg.pointer("/chat/type").and_then(Value::as_str).unwrap_or("private"),
+        "user": from.and_then(|f| f.get("username")).and_then(Value::as_str),
+        "user_id": from.and_then(|f| f.get("id")).and_then(Value::as_i64),
+    });
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    use std::io::Write;
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        Ok(mut f) => {
+            if let Err(e) = writeln!(f, "{entry}") {
+                eprintln!(
+                    "warn: could not write suggestion to {}: {e}",
+                    path.display()
+                );
+            }
+        }
+        Err(e) => eprintln!("warn: could not open {}: {e}", path.display()),
+    }
 }
 
 // ── Telegram ────────────────────────────────────────────────────────────────
@@ -792,7 +915,11 @@ fn main() -> Result<()> {
             json!({"role": "system", "content": system_prompt(&ctx)}),
             json!({"role": "user", "content": question}),
         ];
-        println!("{}", ask_groq(&agent, &cfg, messages)?);
+        let (suggestion, reply) = extract_suggestion(&ask_groq(&agent, &cfg, messages)?);
+        if let Some(s) = suggestion {
+            eprintln!("[suggestion] {s}");
+        }
+        println!("{reply}");
         return Ok(());
     }
 
@@ -952,9 +1079,21 @@ fn main() -> Result<()> {
 
             match ask_groq(&agent, &cfg, messages) {
                 Ok(answer) => {
-                    tg_reply(&agent, &cfg, chat_id, &answer);
+                    let (suggestion, reply) = extract_suggestion(&answer);
+                    // If the model flagged a suggestion but left no body, still
+                    // give the user an acknowledgement.
+                    let reply = if reply.is_empty() {
+                        "¡Buena idea! La anoto para que el mantenedor la valore. 🫏".to_string()
+                    } else {
+                        reply
+                    };
+                    if let Some(summary) = &suggestion {
+                        log_suggestion(&cfg, msg, chat_id, summary, text);
+                        eprintln!("suggestion logged: {summary}");
+                    }
+                    tg_reply(&agent, &cfg, chat_id, &reply);
                     hist.push(json!({"role": "user", "content": text}));
-                    hist.push(json!({"role": "assistant", "content": truncate(&answer, 800)}));
+                    hist.push(json!({"role": "assistant", "content": truncate(&reply, 800)}));
                     let keep = cfg.history_messages.max(2);
                     while hist.len() > keep {
                         hist.remove(0);
@@ -997,5 +1136,32 @@ Más info: [docs](https://x/y?a=1&b=2)";
             let close = joined.matches(&format!("</{tag}>")).count();
             assert_eq!(open, close, "unbalanced <{tag}>");
         }
+    }
+
+    #[test]
+    fn extracts_suggestion_tag() {
+        let (sug, body) = extract_suggestion(
+            "[SUGGESTION] Range selection with Shift+Arrow in the list\n\n\
+             ¡Buena idea! La anoto para que el mantenedor la valore.",
+        );
+        assert_eq!(
+            sug.as_deref(),
+            Some("Range selection with Shift+Arrow in the list")
+        );
+        assert!(body.starts_with("¡Buena idea!"));
+        assert!(!body.contains("[SUGGESTION]"));
+    }
+
+    #[test]
+    fn plain_answer_has_no_suggestion() {
+        let (sug, body) = extract_suggestion("Usa rucio config set …");
+        assert!(sug.is_none());
+        assert_eq!(body, "Usa rucio config set …");
+    }
+
+    #[test]
+    fn iso_utc_known_epochs() {
+        assert_eq!(iso_utc(0), "1970-01-01T00:00:00Z");
+        assert_eq!(iso_utc(1_794_787_200), "2026-11-16T00:00:00Z");
     }
 }

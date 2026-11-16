@@ -80,6 +80,28 @@ Telegram **privacy mode** (BotFather → `/setprivacy`):
 
 Either way `/rucio <pregunta>` works, so it is the safe choice if you are unsure.
 
+## Collecting suggestions
+
+The bot also recognises **feature suggestions**, not just questions. For each it
+makes a judgement:
+
+- Something you can already do or configure yourself (it is in the docs, or it is
+  your own setup — e.g. adding a package to your container image): it just tells
+  you how, and records nothing.
+- A genuine idea that is not possible yet (a missing feature, a UX improvement):
+  it acknowledges it — **without promising anything** — and appends a one-line
+  summary to a log for the maintainer to review.
+
+Suggestions are written as JSON Lines to `SUGGESTIONS_FILE` (one object per line
+with the summary, the original message, a timestamp and the chat/user it came
+from). It defaults to `suggestions.jsonl` **beside the docs cache**, so the same
+volume or `StateDirectory` that persists the cache keeps the suggestions too. Set
+`SUGGESTIONS_FILE=` (empty) to disable logging. Review them with, e.g.:
+
+```sh
+jq -r '.date + "  " + .summary' suggestions.jsonl
+```
+
 ## Run as a service (systemd, native binary)
 
 Install the binary (e.g. to `/usr/local/bin/donrucio`) and create
