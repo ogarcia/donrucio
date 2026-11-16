@@ -49,6 +49,10 @@ Ask a single question on the command line (only needs `GROQ_API_KEY`):
 GROQ_API_KEY=gsk_... ./target/release/donrucio --ask "¿Cómo limito la subida?"
 ```
 
+This is also the quickest way to try the suggestion classifier: if the model
+flags the message, `--ask` prints the recorded summary to stderr (as
+`[suggestion] …`) and strips it from the answer — it does not write to the log.
+
 ## Configuration
 
 Everything is set through environment variables — see
@@ -95,11 +99,19 @@ makes a judgement:
 Suggestions are written as JSON Lines to `SUGGESTIONS_FILE` (one object per line
 with the summary, the original message, a timestamp and the chat/user it came
 from). It defaults to `suggestions.jsonl` **beside the docs cache**, so the same
-volume or `StateDirectory` that persists the cache keeps the suggestions too. Set
+volume or `StateDirectory` that persists the cache keeps the suggestions too (see
+[systemd](#run-as-a-service-systemd-native-binary) and
+[Podman / Docker](#run-with-podman--docker) for where the file lands there). Set
 `SUGGESTIONS_FILE=` (empty) to disable logging. Review them with, e.g.:
 
 ```sh
 jq -r '.date + "  " + .summary' suggestions.jsonl
+```
+
+A line looks like:
+
+```json
+{"ts":1794787200,"date":"2026-11-16T00:00:00Z","summary":"Multi-select with Shift+Arrow in the downloads list","message":"Estaría genial poder seleccionar…","chat_id":123,"chat_type":"private","user":"someone","user_id":456}
 ```
 
 ## Run as a service (systemd, native binary)
@@ -141,6 +153,13 @@ The tokens live in the unit, which is root-owned under `/etc/systemd/system`.
 If you prefer to keep them out of the unit, replace the `Environment=` token
 lines with `EnvironmentFile=/etc/donrucio.env` (a `chmod 600` file).
 
+The docs cache and the **suggestions log** sit under the unit's `StateDirectory`,
+so they survive restarts. Read the collected suggestions with:
+
+```sh
+sudo cat /var/lib/donrucio/suggestions.jsonl
+```
+
 ## Run with Podman / Docker
 
 Pass the tokens as environment variables — no `.env` needed. The bot talks to
@@ -155,11 +174,21 @@ podman run -d --name donrucio --restart=unless-stopped \
 ```
 
 (Use `docker` in place of `podman`; the flags are identical.) Any override is
-just another `-e`, e.g. `-e GROQ_MODEL=openai/gpt-oss-20b`. To keep the docs
-cache across restarts, mount a volume and point the cache at it:
+just another `-e`, e.g. `-e GROQ_MODEL=openai/gpt-oss-20b`.
+
+Mount a volume if you want the docs cache **and the suggestions log** to survive
+a restart or re-create — without one both live inside the container and vanish
+when it is removed. Point the cache into the volume and the suggestions file
+follows it (it defaults beside the cache):
 
 ```sh
   -e DOCS_CACHE=/data/docs.md -v donrucio-data:/data
+```
+
+Read the collected suggestions straight from the volume:
+
+```sh
+podman exec donrucio cat /data/suggestions.jsonl
 ```
 
 Logs: `podman logs -f donrucio`.
@@ -173,3 +202,6 @@ Logs: `podman logs -f donrucio`.
   cheap.
 - Retrieval is keyword-based, so very indirect phrasing may miss the right
   section. Extend the synonym map in `src/main.rs` if you spot gaps.
+- Deciding what counts as a recordable suggestion is the model's judgement, so
+  it may occasionally log something minor or miss a borderline one — skim the log
+  and prune. The bot never promises a feature; it only notes it for review.
